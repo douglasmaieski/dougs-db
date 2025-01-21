@@ -29,6 +29,11 @@ struct ddb_node {
   unsigned char key[];
 };
 
+struct ddb_iter {
+  struct ddb *ddb;
+  unsigned long node_ptr;
+};
+
 struct ddb_meta {
   unsigned long salt[2];
   unsigned long root_ptr;
@@ -90,6 +95,14 @@ long ddb_read(struct ddb_result *res,
               void *dest,
               unsigned long len,
               struct gt_w *w);
+
+long ddb_iter(struct ddb_iter *iter,
+              struct ddb *ddb,
+              struct gt_w *w);
+
+long ddb_iter_next(struct ddb_result *res,
+                   struct ddb_iter *iter,
+                   struct gt_w *w);
 
 long ddb_restart_after_failure(struct ddb *ddb, struct gt_w *w);
 

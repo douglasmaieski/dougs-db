@@ -3,6 +3,8 @@ This is a small, simple, key-value database written in C, built on top of https:
 
 I'm planning to use it for web projects.
 
+**Note: there are bugs**
+
 ## How it works
 - The keys are hashed and stored in a binary tree
 - There's a file with all the DB content

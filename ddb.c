@@ -10,6 +10,7 @@
 #include "thread.h"
 #include "base.h"
 
+#include <assert.h>
 #include <sys/random.h>
 #include <openssl/sha.h>
 #include <sys/statvfs.h>
@@ -72,10 +73,11 @@ long ddb_create(const char *name, unsigned long initial_size)
   ptr = 4096 + 80; 
   write(fd, &ptr, 8);
 
-  lseek(fd, ptr - 80, SEEK_SET);
+  lseek(fd, 4096, SEEK_SET);
 
   struct ddb_node root;
   memset(&root, 0, sizeof root);
+  root.content = 4096 + 80;
   getrandom(root.hash, 32, 0);
   write(fd, &root, 80);
 
@@ -206,23 +208,24 @@ static long _write(struct ddb *ddb,
                    struct gt_w *w)
 {
   // read first
-  unsigned long aligned_off = offset - (offset % ddb->bsize);
+  unsigned long pos = offset - (offset % ddb->bsize);
+  unsigned long idx = pos / ddb->bsize;
+  offset = offset % ddb->bsize;
+
   long r;
-  while (data_len) {
-    struct cache_node *node = load_page(ddb, aligned_off / ddb->bsize, w);
+  while (data_len > 0) {
+    struct cache_node *node = load_page(ddb, idx, w);
 
     while (!try_lock(&node->lock)) {
       gt_w_nop(w);
     }
 
     char *data1 = node->data;
-
-    unsigned long n = ddb->bsize - (offset % ddb->bsize);
+    unsigned long n = ddb->bsize - offset;
     unsigned long avail = n < data_len ? n : data_len;
+    memcpy(data1 + offset, data, avail);
 
-    memcpy(data1 + offset % ddb->bsize, data, avail);
-
-    r = gt_w_write(w, ddb->dbfd, aligned_off, data1, ddb->bsize);
+    r = gt_w_write(w, ddb->dbfd, pos, data1, ddb->bsize);
 
     unlock(&node->lock);
 
@@ -230,9 +233,10 @@ static long _write(struct ddb *ddb,
       goto err;
 
     data = (char *)data + avail;
-    aligned_off += ddb->bsize;
+    pos += ddb->bsize;
+    ++idx;
     data_len -= avail;
-    offset = aligned_off;
+    offset = 0;
   }
 
   return 1;
@@ -347,11 +351,20 @@ static long _append_route(struct ddb *ddb,
     gt_w_nop(w);
   }
 
+  assert(route->addr != 0);
+
+/*
+  while (!try_lock(&ddb->map_lock)) {
+    gt_w_nop(w);
+  }
+  */
+
   struct ddb_route *node = ddb->route_root;
 
   if (!node) {
     ddb->route_root = route;
     route->level = 0;
+    //unlock(&ddb->map_lock);
     unlock(&route->lock);
     return 1;
   }
@@ -359,6 +372,8 @@ static long _append_route(struct ddb *ddb,
   while (!try_lock(&node->lock)) {
     gt_w_nop(w);
   }
+
+  //unlock(&ddb->map_lock);
 
   route->level = 1;
 
@@ -405,6 +420,7 @@ static long _append_route(struct ddb *ddb,
       }
       else {
         struct ddb_route *next = node->right;
+
         while (!try_lock(&node->right->lock)) {
           gt_w_nop(w);
         }
@@ -457,11 +473,12 @@ long ddb_upsert(struct ddb *ddb,
   if (bucket0 != bucket1)
     new_node_ptr = bucket1 * ddb->bsize;
 
-  unsigned long new_node_real_len = sizeof(struct ddb_node) + key_len;
+  assert(new_node_ptr >= 4096 + 80);
 
+  unsigned long new_node_real_len = sizeof(struct ddb_node) + key_len;
   new_node.content = new_node_ptr + new_node_real_len;
 
-  unsigned long new_data_real_len = data_len;
+  assert(new_node.content >= 4096 + 80 + 80);
 
   // insert data
   char raw_buf[ddb->bsize * 2 - 1];
@@ -471,9 +488,16 @@ long ddb_upsert(struct ddb *ddb,
   void *aligned = (void*)raw_addr;
 
   long r;
-  r = _write(ddb, aligned, new_node.content, data, data_len, w);
+
+  r = _write(ddb, aligned, new_node_ptr + 80, key, key_len, w);
   if (!r)
     goto err;
+
+  if (data_len > 0) {
+    r = _write(ddb, aligned, new_node.content, data, data_len, w);
+    if (!r)
+      goto err;
+  }
 
   while (gt_w_fsync(w, ddb->dbfd) < 0) {
   }
@@ -485,15 +509,10 @@ long ddb_upsert(struct ddb *ddb,
   while (gt_w_fsync(w, lock_fd) < 0) {
   }
 
-  unsigned long new_file_ptr = new_node_ptr
-                               + new_node_real_len
-                               + new_data_real_len;
-
+  unsigned long new_file_ptr = new_node.content + new_node.size;
   
-  struct ddb_node parent;
   struct ddb_node node;
   unsigned long ptr = ddb->meta.root_ptr;
-  unsigned long parent_ptr = 0;
   unsigned int depth = 0;
   struct ddb_route *route = _find_route(ddb, new_node.hash, w);
   struct ddb_route *upserted = NULL;
@@ -506,8 +525,10 @@ long ddb_upsert(struct ddb *ddb,
     node.left = route->left ? route->left->addr : 0;
     node.right = route->right ? route->right->addr : 0;
 
-    depth = route->level;
+    assert(node.parent || route->addr == 4096);
+
     ptr = route->addr;
+    depth = route->level;
 
     if (memcmp(route->id, new_node.hash, 32) == 0) {
       upserted = route;
@@ -517,11 +538,14 @@ long ddb_upsert(struct ddb *ddb,
   }
 
   while (1) {
+    assert(ptr >= 4096);
+
     r = _read(ddb, aligned, ptr, &node, 80, w);
     if (!r)
       goto err;
-
     if (depth++ < 17 && !route) {
+      assert(!upserted);
+
       while (!try_lock(&ddb->map_lock)) {
         gt_w_nop(w);
       }
@@ -538,10 +562,17 @@ long ddb_upsert(struct ddb *ddb,
       unlock(&ddb->map_lock);
     }
 
+    assert(node.parent || node.content == 4096 + 80);
     route = NULL;
 
     int diff = memcmp(new_node.hash, node.hash, 32);
+    if (upserted) {
+      assert(diff == 0);
+    }
+
     if (diff == 0) {
+      assert(node.content != 4096 + 80);
+
       new_node.left = node.left;
       new_node.right = node.right;
       new_node.parent = node.parent;
@@ -550,7 +581,36 @@ long ddb_upsert(struct ddb *ddb,
       if (!r)
         goto err;
 
-      r = _write(ddb, aligned, new_node_ptr + 80, key, key_len, w);
+      struct ddb_node child;
+
+      if (new_node.left) {
+        r = _read(ddb, aligned, new_node.left, &child, 80, w);
+        if (!r)
+          goto err;
+
+        assert(child.parent == ptr);
+
+        child.parent = new_node_ptr;
+        r = _write(ddb, aligned, new_node.left, &child, 80, w);
+        if (!r)
+          goto err;
+      }
+
+      if (new_node.right) {
+        r = _read(ddb, aligned, new_node.right, &child, 80, w);
+        if (!r)
+          goto err;
+
+        assert(child.parent == ptr);
+
+        child.parent = new_node_ptr;
+        r = _write(ddb, aligned, new_node.right, &child, 80, w);
+        if (!r)
+          goto err;
+      }
+
+      struct ddb_node parent;
+      r = _read(ddb, aligned, new_node.parent, &parent, 80, w);
       if (!r)
         goto err;
 
@@ -558,12 +618,21 @@ long ddb_upsert(struct ddb *ddb,
         parent.right = new_node_ptr;
       }
       else {
+        assert(parent.left == ptr);
         parent.left = new_node_ptr;
       }
 
-      r = _write(ddb, aligned, parent_ptr, &parent, 80, w);
+      r = _write(ddb, aligned, new_node.parent, &parent, 80, w);
       if (!r)
         goto err;
+
+      if (upserted) {
+        while (!try_lock(&upserted->lock)) {
+          gt_w_nop(w);
+        }
+        upserted->addr = new_node_ptr;
+        unlock(&upserted->lock);
+      }
 
       break;
     }
@@ -575,10 +644,6 @@ long ddb_upsert(struct ddb *ddb,
         node.left = new_node_ptr;
 
         r = _write(ddb, aligned, new_node_ptr, &new_node, 80, w);
-        if (!r)
-          goto err;
-
-        r = _write(ddb, aligned, new_node_ptr + 80, key, key_len, w);
         if (!r)
           goto err;
 
@@ -603,10 +668,6 @@ long ddb_upsert(struct ddb *ddb,
         if (!r)
           goto err;
 
-        r = _write(ddb, aligned, new_node_ptr + 80, key, key_len, w);
-        if (!r)
-          goto err;
-
         r = _write(ddb, aligned, ptr, &node, 80, w);
         if (!r)
           goto err;
@@ -617,9 +678,6 @@ long ddb_upsert(struct ddb *ddb,
         ptr = node.right;
       }
     }
-
-    parent = node;
-    parent_ptr = ptr;
   }
 
   ddb->meta.file_ptr = new_file_ptr;
@@ -629,16 +687,6 @@ long ddb_upsert(struct ddb *ddb,
     goto err;
 
   while (gt_w_fsync(w, ddb->dbfd) < 0) {
-  }
-
-  if (upserted) {
-    while (!try_lock(&upserted->lock)) {
-      gt_w_nop(w);
-    }
-
-    upserted->addr = new_node_ptr;
-
-    unlock(&upserted->lock);
   }
 
   while (gt_w_close(w, lock_fd) < 0) {
@@ -693,6 +741,7 @@ long ddb_find(struct ddb_result *res,
   if (route) {
     memcpy(node.hash, route->id, 32);
 
+    assert(route->addr >= 4096);
     node.content = route->addr + 80;
     node.parent = route->parent ? route->parent->addr : 0;
     node.left = route->left ? route->left->addr : 0;
@@ -778,6 +827,7 @@ long ddb_read(struct ddb_result *res,
   return n;
 }
 
+// TODO FIXME
 long ddb_restart_after_failure(struct ddb *ddb, struct gt_w *w)
 {
   char raw_buf[ddb->bsize * 2 - 1];
@@ -875,4 +925,87 @@ err1:
   }
 err:
   return 0;
+}
+
+
+long ddb_iter(struct ddb_iter *iter,
+              struct ddb *ddb,
+              struct gt_w *w)
+{
+  iter->ddb = ddb;
+  iter->node_ptr = ddb->meta.root_ptr;
+  return 1;
+}
+
+static unsigned long fix_node_ptr(struct ddb *ddb, unsigned long node_ptr)
+{
+  unsigned long bucket0 = node_ptr / ddb->bsize;
+  unsigned long bucket1 = (node_ptr + 80) / ddb->bsize;
+  if (bucket0 != bucket1)
+    node_ptr = bucket1 * ddb->bsize;
+
+  return node_ptr;
+}
+
+long ddb_iter_next(struct ddb_result *res,
+                   struct ddb_iter *iter,
+                   struct gt_w *w)
+{
+  struct ddb *ddb = iter->ddb;
+  char raw_buf[ddb->bsize * 2 - 1];
+  unsigned long raw_addr = (unsigned long)raw_buf;
+  raw_addr += ddb->bsize - 1;
+  raw_addr -= raw_addr % ddb->bsize;
+  void *aligned = (void*)raw_addr;
+
+  int skipping = 1;
+  unsigned long node_ptr = iter->node_ptr;
+
+  while (1) {
+    assert(node_ptr <= ddb->meta.file_ptr);
+
+    if (node_ptr == ddb->meta.file_ptr)
+      return 0;
+
+    // get the node
+    struct ddb_node node;
+    long r = _read(ddb, aligned, node_ptr, &node, 80, w);
+    if (!r)
+      return 0;
+
+    assert(node.content);
+
+    if (skipping || node.size == 0) {
+      node_ptr = node.content + node.size;
+      node_ptr = fix_node_ptr(ddb, node_ptr);
+      skipping = 0;
+      continue;
+    }
+
+    // if the node was deleted, the parent won't show it
+    if (node.parent) {
+      assert(node_ptr >= 4096 + 80);
+
+      struct ddb_node parent_node;
+      r = _read(ddb, aligned, node.parent, &parent_node, 80, w);
+      if (!r)
+        return 0;
+
+      if (parent_node.left == node_ptr || parent_node.right == node_ptr) {
+        // it wasn't deleted
+        // just return it
+        node_ptr = fix_node_ptr(ddb, node_ptr);
+        iter->node_ptr = node_ptr;
+        res->start = node.content;
+        res->pos = 0;
+        res->size = node.size;
+        res->ddb = ddb;
+        return 1;
+      }
+
+      // this means the node was deleted
+      node_ptr = node.content + node.size;
+      node_ptr = fix_node_ptr(ddb, node_ptr);
+    }
+  }
 }
