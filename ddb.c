@@ -77,8 +77,8 @@ long ddb_create(const char *name, unsigned long initial_size)
 
   struct ddb_node root;
   memset(&root, 0, sizeof root);
-  root.content = 4096 + 80;
   getrandom(root.hash, 32, 0);
+  root.content = 4096 + 80;
   write(fd, &root, 80);
 
   return 1;
@@ -353,18 +353,11 @@ static long _append_route(struct ddb *ddb,
 
   assert(route->addr != 0);
 
-/*
-  while (!try_lock(&ddb->map_lock)) {
-    gt_w_nop(w);
-  }
-  */
-
   struct ddb_route *node = ddb->route_root;
 
   if (!node) {
     ddb->route_root = route;
     route->level = 0;
-    //unlock(&ddb->map_lock);
     unlock(&route->lock);
     return 1;
   }
@@ -372,8 +365,6 @@ static long _append_route(struct ddb *ddb,
   while (!try_lock(&node->lock)) {
     gt_w_nop(w);
   }
-
-  //unlock(&ddb->map_lock);
 
   route->level = 1;
 
@@ -518,15 +509,6 @@ long ddb_upsert(struct ddb *ddb,
   struct ddb_route *upserted = NULL;
 
   if (route) {
-    memcpy(node.hash, route->id, 32);
-
-    node.content = route->addr + 80;
-    node.parent = route->parent ? route->parent->addr : 0;
-    node.left = route->left ? route->left->addr : 0;
-    node.right = route->right ? route->right->addr : 0;
-
-    assert(node.parent || route->addr == 4096);
-
     ptr = route->addr;
     depth = route->level;
 
@@ -543,9 +525,22 @@ long ddb_upsert(struct ddb *ddb,
     r = _read(ddb, aligned, ptr, &node, 80, w);
     if (!r)
       goto err;
-    if (depth++ < 17 && !route) {
-      assert(!upserted);
 
+    if (upserted) {
+      while (!try_lock(&upserted->lock)) {
+        gt_w_nop(w);
+      }
+      upserted->addr = new_node_ptr;
+      unlock(&upserted->lock);
+    }
+
+    if (route) {
+      if (memcmp(route->id, node.hash, 32) != 0) {
+        route = NULL;
+      }
+    }
+
+    if (depth++ < 17 && !route) {
       while (!try_lock(&ddb->map_lock)) {
         gt_w_nop(w);
       }
@@ -562,14 +557,12 @@ long ddb_upsert(struct ddb *ddb,
       unlock(&ddb->map_lock);
     }
 
-    assert(node.parent || node.content == 4096 + 80);
     route = NULL;
 
-    int diff = memcmp(new_node.hash, node.hash, 32);
-    if (upserted) {
-      assert(diff == 0);
-    }
 
+    assert(node.parent || node.content == 4096 + 80);
+
+    int diff = memcmp(new_node.hash, node.hash, 32);
     if (diff == 0) {
       assert(node.content != 4096 + 80);
 
@@ -626,14 +619,6 @@ long ddb_upsert(struct ddb *ddb,
       if (!r)
         goto err;
 
-      if (upserted) {
-        while (!try_lock(&upserted->lock)) {
-          gt_w_nop(w);
-        }
-        upserted->addr = new_node_ptr;
-        unlock(&upserted->lock);
-      }
-
       break;
     }
 
@@ -678,6 +663,29 @@ long ddb_upsert(struct ddb *ddb,
         ptr = node.right;
       }
     }
+
+    ++depth;
+  }
+
+  if (route && memcmp(route->id, node.hash, 32) != 0) {
+    route = NULL;
+  }
+
+  if (depth++ < 17) {
+    while (!try_lock(&ddb->map_lock)) {
+      gt_w_nop(w);
+    }
+
+    struct ddb_route *new_route = ddb->map + ddb->route_pos++;
+
+    memcpy(new_route->id, new_node.hash, 32);
+    new_route->addr = new_node_ptr;
+    new_route->lock = 0;
+
+    if (!_append_route(ddb, new_route, w))
+      --ddb->route_pos;
+
+    unlock(&ddb->map_lock);
   }
 
   ddb->meta.file_ptr = new_file_ptr;
@@ -739,13 +747,13 @@ long ddb_find(struct ddb_result *res,
   struct ddb_route *route = _find_route(ddb, hash, w);
 
   if (route) {
-    memcpy(node.hash, route->id, 32);
+    //memcpy(node.hash, route->id, 32);
 
     assert(route->addr >= 4096);
-    node.content = route->addr + 80;
-    node.parent = route->parent ? route->parent->addr : 0;
-    node.left = route->left ? route->left->addr : 0;
-    node.right = route->right ? route->right->addr : 0;
+    //node.content = route->addr + 80;
+    //node.parent = route->parent ? route->parent->addr : 0;
+    //node.left = route->left ? route->left->addr : 0;
+    //node.right = route->right ? route->right->addr : 0;
 
     depth = route->level;
     ptr = route->addr;
