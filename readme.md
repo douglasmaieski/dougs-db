@@ -16,5 +16,4 @@ I have yet to test it on a good computer, but my tests showed decent performance
 
 ## TODO
 1. Write a defragmenter
-2. Allow iterating in asc/desc order
 3. Improve write performance
