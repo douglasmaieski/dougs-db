@@ -667,11 +667,7 @@ long ddb_upsert(struct ddb *ddb,
     ++depth;
   }
 
-  if (route && memcmp(route->id, node.hash, 32) != 0) {
-    route = NULL;
-  }
-
-  if (depth++ < 17) {
+  if (depth++ < 17 && !upserted) {
     while (!try_lock(&ddb->map_lock)) {
       gt_w_nop(w);
     }
@@ -747,13 +743,7 @@ long ddb_find(struct ddb_result *res,
   struct ddb_route *route = _find_route(ddb, hash, w);
 
   if (route) {
-    //memcpy(node.hash, route->id, 32);
-
     assert(route->addr >= 4096);
-    //node.content = route->addr + 80;
-    //node.parent = route->parent ? route->parent->addr : 0;
-    //node.left = route->left ? route->left->addr : 0;
-    //node.right = route->right ? route->right->addr : 0;
 
     depth = route->level;
     ptr = route->addr;
