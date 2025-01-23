@@ -857,53 +857,111 @@ long ddb_restart_after_failure(struct ddb *ddb, struct gt_w *w)
       goto err1;
 
     int diff = memcmp(new_node.hash, node.hash, 32);
-    if (diff < 0) {
-      if (node.left != 0) {
-        if (node.left != new_node_ptr) {
-          ptr = node.left;
-        }
-        else {
-          // reinsert new node
-          node.left = new_node_ptr;
-          break;
-        }
+    if (diff == 0) {
+      new_node.parent = node.parent;
+      new_node.left = node.left;
+      new_node.right = node.right;
+
+      // either an update or a partially written node
+      // the parent and children come from the log
+      r = _write(ddb, aligned, new_node_ptr, &new_node, 80, w);
+      if (!r)
+        goto err1;
+
+      // if there are children, then it's an update
+      struct ddb_node child;
+
+      if (new_node.left) {
+        // update the left child if there is one
+        r = _read(ddb, aligned, new_node.left, &child, 80, w);
+        if (!r)
+          goto err1;
+
+        child.parent = new_node_ptr;
+        r = _write(ddb, aligned, new_node.left, &child, 80, w);
+        if (!r)
+          goto err1;
+      }
+
+      if (new_node.right) {
+        // also update the right child
+        r = _read(ddb, aligned, new_node.right, &child, 80, w);
+        if (!r)
+          goto err1;
+
+        child.parent = new_node_ptr;
+        r = _write(ddb, aligned, new_node.right, &child, 80, w);
+        if (!r)
+          goto err1;
+      }
+
+      // last update the parent
+      struct ddb_node parent;
+      r = _read(ddb, aligned, new_node.parent, &parent, 80, w);
+      if (!r)
+        goto err1;
+
+      if (parent.right == ptr || parent.right == new_node_ptr) {
+        parent.right = new_node_ptr;
       }
       else {
-        // insert new node
+        assert(parent.left == ptr || parent.right == new_node_ptr);
+        parent.left = new_node_ptr;
+      }
+
+      r = _write(ddb, aligned, new_node.parent, &parent, 80, w);
+      if (!r)
+        goto err1;
+
+      break;
+    }
+    else if (diff < 0) {
+      if (node.left != 0 && node.left != new_node_ptr) {
+        ptr = node.left;
+      }
+      else {
+        // reinsert new node
         node.left = new_node_ptr;
+
+        long r = _write(ddb, aligned, ptr, &node, 80, w);
+        if (!r)
+          goto err1;
+
+        r = _write(ddb, aligned, new_node_ptr, &new_node, 80, w);
+        if (!r)
+          goto err1;
+
         break;
       }
     }
     else {
-      if (node.right != 0) {
-        if (node.right != new_node_ptr) {
-          ptr = node.right;
-        }
-        else {
-          // reinsert new node
-          node.right = new_node_ptr;
-          break;
-        }
+      assert(diff > 0);
+
+      if (node.right != 0 && node.right != new_node_ptr) {
+        ptr = node.right;
       }
       else {
         // insert new node
         node.right = new_node_ptr;
+
+        long r = _write(ddb, aligned, ptr, &node, 80, w);
+        if (!r)
+          goto err1;
+
+        r = _write(ddb, aligned, new_node_ptr, &new_node, 80, w);
+        if (!r)
+          goto err1;
+
         break;
       }
     }
+
+    parent = node;
   }
-
-  long r = _write(ddb, aligned, ptr, &node, 80, w);
-  if (!r)
-    goto err1;
-
-  r = _write(ddb, aligned, new_node_ptr, &new_node, 80, w);
-  if (!r)
-    goto err1;
 
   ddb->meta.file_ptr = new_node.content + new_node.size;
 
-  r = _write(ddb, aligned, 0, &ddb->meta, 32, w);
+  long r = _write(ddb, aligned, 0, &ddb->meta, 32, w);
   if (!r)
     goto err1;
 
