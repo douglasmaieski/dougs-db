@@ -62,11 +62,13 @@ struct ddb {
   struct avl_tree_node *cache_root;
   int lock;
   int map_lock;
+  void *large_buf;
   struct ddb_route *route_root;
   unsigned long route_pos;
   struct ddb_route map[1<<17];
   void *mem;
   void *node_mem;
+  void *large_buf_mem;
 };
 
 long ddb_create(const char *name, unsigned long initial_size);

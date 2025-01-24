@@ -13,6 +13,3 @@ I'm planning to use it for web projects.
 
 ## Performance
 I have yet to test it on a good computer, but my tests showed decent performance.
-
-## TODO
-3. Improve write performance

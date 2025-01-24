@@ -126,12 +126,28 @@ long ddb_open_sync(struct ddb *ddb,
   }
   ddb->node_mem = node_mem;
 
+  char *large_buf_mem = malloc(4096 * 256 + ddb->bsize - 1);
+  if (!large_buf_mem) {
+    free(node_mem);
+    free(mem);
+    close(ddb->dbfd);
+    return 0;
+  }
+  ddb->large_buf_mem = large_buf_mem;
+
   unsigned long aligned = (unsigned long)mem;
   aligned += ddb->bsize - 1;
   aligned /= ddb->bsize;
   aligned *= ddb->bsize;
 
   mem = (char*)aligned;
+
+  aligned = (unsigned long)large_buf_mem;
+  aligned += ddb->bsize - 1;
+  aligned /= ddb->bsize;
+  aligned *= ddb->bsize;
+
+  ddb->large_buf = (char *)aligned; 
 
   for (unsigned long i = 0; i < cached_blocks; ++i) {
     struct cache_node *cache_node = (struct cache_node*)(node_mem
@@ -160,6 +176,7 @@ void ddb_close(struct ddb *ddb, struct gt_w *w)
 
   free(ddb->mem);  
   free(ddb->node_mem);  
+  free(ddb->large_buf_mem);
 
   ddb->cache_root = NULL;
   ddb->route_root = NULL;
@@ -221,6 +238,37 @@ static struct cache_node *load_page(struct ddb *ddb,
   return cache_node;
 }
 
+static void invalidate_page(struct ddb *ddb, unsigned long idx, struct gt_w *w)
+{
+  struct cache_node tmp;
+  tmp.idx = idx;
+
+  while (!try_lock(&ddb->lock)) {
+    gt_w_nop(w);
+  }
+
+  struct avl_tree_node *node = avl_tree_lookup_node(ddb->cache_root,
+                                                    &tmp.avl_node,
+                                                    avl_cmp);
+  struct cache_node *cache_node; 
+
+  if (node) {
+    cache_node = MEMBER_TO_PARENT(struct cache_node, node, avl_node);
+
+    while (cache_node->lock) {
+      // if the node is locked, then its contents are in use
+      gt_w_nop(w);
+    }
+
+    cache_node->idx = 0xffffffffffffffff - idx;
+
+    avl_tree_remove(&ddb->cache_root, &cache_node->avl_node);
+    avl_tree_insert(&ddb->cache_root, &cache_node->avl_node, avl_cmp);
+  }
+
+  unlock(&ddb->lock);
+}
+
 static long _write(struct ddb *ddb,
                    void *aligned_buf,       // must be 1x bsize minimum
                    unsigned long offset,
@@ -234,7 +282,9 @@ static long _write(struct ddb *ddb,
   offset = offset % ddb->bsize;
 
   long r;
-  while (data_len > 0) {
+
+  // first align to block size
+  while (data_len > 0 && offset != 0) {
     struct cache_node *node = load_page(ddb, idx, w);
 
     while (!try_lock(&node->lock)) {
@@ -258,6 +308,60 @@ static long _write(struct ddb *ddb,
     ++idx;
     data_len -= avail;
     offset = 0;
+  }
+
+  // do the bulk writing aligned to block size
+  while (data_len > ddb->bsize) {
+    char *large_buf = ddb->large_buf;
+    unsigned long avail = (256 * 4096) > data_len ? data_len : (256 * 4096);
+
+    unsigned long size;
+    size = avail;                         // minimum size
+    size = size - (size % ddb->bsize);    // align to block size
+
+    memcpy(large_buf, data, size);
+
+    r = gt_w_write(w, ddb->dbfd, pos, large_buf, size);
+    if (r != size)
+      goto err;
+
+    unsigned long page_count = size / ddb->bsize;
+    for (unsigned long idx = pos / ddb->bsize; idx < page_count; ++idx)
+      invalidate_page(ddb, idx, w);
+
+    if (size != avail)
+      break;
+
+    data += size;
+    pos += size;
+    data_len -= size;
+  }
+
+  // finish the incomplete block
+  idx = pos / ddb->bsize;
+  while (data_len > 0) {
+    struct cache_node *node = load_page(ddb, idx, w);
+
+    while (!try_lock(&node->lock)) {
+      gt_w_nop(w);
+    }
+
+    char *data1 = node->data;
+    unsigned long n = ddb->bsize;
+    unsigned long avail = n < data_len ? n : data_len;
+    memcpy(data1, data, avail);
+
+    r = gt_w_write(w, ddb->dbfd, pos, data1, ddb->bsize);
+
+    unlock(&node->lock);
+
+    if (r != ddb->bsize)
+      goto err;
+
+    data = (char *)data + avail;
+    pos += ddb->bsize;
+    ++idx;
+    data_len -= avail;
   }
 
   return 1;
