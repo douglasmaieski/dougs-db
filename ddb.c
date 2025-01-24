@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 struct cache_node {
   struct list_node list_node;
@@ -103,6 +104,10 @@ long ddb_open_sync(struct ddb *ddb,
     return 0;
   }
 
+  sprintf(ddb->write_lock_name + 0, "%.16lx", ddb->meta.salt[0]);
+  sprintf(ddb->write_lock_name + 16, "%.16lx", ddb->meta.salt[1]);
+  strcpy(ddb->write_lock_name + 32, "-write-lock");
+
   list_init(&ddb->cache_list);
   ddb->cache_root = NULL;
 
@@ -142,6 +147,7 @@ long ddb_open_sync(struct ddb *ddb,
   ddb->route_pos = 0;
 
   ddb->lock = 0;
+
 
   return 1;
 }
@@ -446,7 +452,11 @@ long ddb_insert(struct ddb *ddb,
   long lock_fd;
 
   while (1) {
-    lock_fd = gt_w_openat(w, ddb->dirfd, "write-lock", O_CREAT|O_RDWR|O_EXCL, 0600);
+    lock_fd = gt_w_openat(w,
+                          ddb->dirfd,
+                          ddb->write_lock_name,
+                          O_CREAT|O_RDWR|O_EXCL,
+                          0600);
     if (lock_fd >= 0)
       break;
   }
@@ -643,7 +653,7 @@ long ddb_insert(struct ddb *ddb,
   while (gt_w_close(w, lock_fd) < 0) {
   }
 
-  while (gt_w_unlinkat(w, ddb->dirfd, "write-lock", 0) < 0) {
+  while (gt_w_unlinkat(w, ddb->dirfd, ddb->write_lock_name, 0) < 0) {
   }
 
   return 1;
@@ -655,7 +665,7 @@ exists:
   while (gt_w_close(w, lock_fd) < 0) {
   }
 
-  while (gt_w_unlinkat(w, ddb->dirfd, "write-lock", 0) < 0) {
+  while (gt_w_unlinkat(w, ddb->dirfd, ddb->write_lock_name, 0) < 0) {
   }
 
   return 0;
@@ -664,7 +674,7 @@ err:
   while (gt_w_close(w, lock_fd) < 0) {
   }
 
-  while (gt_w_unlinkat(w, ddb->dirfd, "write-lock", 0) < 0) {
+  while (gt_w_unlinkat(w, ddb->dirfd, ddb->write_lock_name, 0) < 0) {
   }
 
   return -1;
@@ -681,7 +691,11 @@ long ddb_upsert(struct ddb *ddb,
   long lock_fd;
 
   while (1) {
-    lock_fd = gt_w_openat(w, ddb->dirfd, "write-lock", O_CREAT|O_RDWR|O_EXCL, 0600);
+    lock_fd = gt_w_openat(w,
+                          ddb->dirfd,
+                          ddb->write_lock_name,
+                          O_CREAT|O_RDWR|O_EXCL,
+                          0600);
     if (lock_fd >= 0)
       break;
   }
@@ -944,7 +958,7 @@ long ddb_upsert(struct ddb *ddb,
   while (gt_w_close(w, lock_fd) < 0) {
   }
 
-  while (gt_w_unlinkat(w, ddb->dirfd, "write-lock", 0) < 0) {
+  while (gt_w_unlinkat(w, ddb->dirfd, ddb->write_lock_name, 0) < 0) {
   }
 
   return 1;
@@ -953,7 +967,7 @@ err:
   while (gt_w_close(w, lock_fd) < 0) {
   }
 
-  while (gt_w_unlinkat(w, ddb->dirfd, "write-lock", 0) < 0) {
+  while (gt_w_unlinkat(w, ddb->dirfd, ddb->write_lock_name, 0) < 0) {
   }
 
   return 0;
@@ -1082,7 +1096,7 @@ long ddb_restart_after_failure(struct ddb *ddb, struct gt_w *w)
   void *aligned = (void*)raw_addr;
 
   // open log
-  long lock_fd = gt_w_openat(w, ddb->dirfd, "write-lock", O_RDONLY, 0);
+  long lock_fd = gt_w_openat(w, ddb->dirfd, ddb->write_lock_name, O_RDONLY, 0);
   if (lock_fd < 0) {
     goto err;
   }
@@ -1157,7 +1171,7 @@ long ddb_restart_after_failure(struct ddb *ddb, struct gt_w *w)
 end:
   while (gt_w_close(w, lock_fd) < 0) {
   }
-  while (gt_w_unlinkat(w, ddb->dirfd, "write-lock", 0) < 0) {
+  while (gt_w_unlinkat(w, ddb->dirfd, ddb->write_lock_name, 0) < 0) {
   }
 
   return 1;

@@ -54,6 +54,7 @@ struct ddb_route {
 
 struct ddb {
   struct ddb_meta meta;
+  char write_lock_name[48];
   long dbfd;
   long dirfd;
   unsigned long bsize;
@@ -62,7 +63,7 @@ struct ddb {
   int lock;
   int map_lock;
   struct ddb_route *route_root;
-  volatile unsigned long route_pos;
+  unsigned long route_pos;
   struct ddb_route map[1<<17];
 };
 
