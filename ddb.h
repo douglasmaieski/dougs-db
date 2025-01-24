@@ -65,6 +65,8 @@ struct ddb {
   struct ddb_route *route_root;
   unsigned long route_pos;
   struct ddb_route map[1<<17];
+  void *mem;
+  void *node_mem;
 };
 
 long ddb_create(const char *name, unsigned long initial_size);
@@ -73,6 +75,8 @@ long ddb_open_sync(struct ddb *ddb,
                    const char *path,
                    int dirfd,
                    unsigned long cached_blocks);
+
+void ddb_close(struct ddb *ddb, struct gt_w *w);
 
 long ddb_insert(struct ddb *ddb,
                 const void *key,
@@ -113,6 +117,13 @@ long ddb_iter_next(struct ddb_result *res,
                    struct ddb_iter *iter,
                    struct gt_w *w);
 
+long ddb_iter_get_key_and_key_len(void *key,
+                                  unsigned long *key_len,
+                                  struct ddb_iter *iter,
+                                  struct gt_w *w);
+
 long ddb_restart_after_failure(struct ddb *ddb, struct gt_w *w);
+
+long ddb_defragment(const char *name, struct ddb *ddb, struct gt_w *w);
 
 #endif

@@ -116,6 +116,7 @@ long ddb_open_sync(struct ddb *ddb,
     close(ddb->dbfd);
     return 0;
   }
+  ddb->mem = mem;
 
   char *node_mem = malloc(sizeof(struct cache_node) * cached_blocks);
   if (!node_mem) {
@@ -123,6 +124,7 @@ long ddb_open_sync(struct ddb *ddb,
     close(ddb->dbfd);
     return 0;
   }
+  ddb->node_mem = node_mem;
 
   unsigned long aligned = (unsigned long)mem;
   aligned += ddb->bsize - 1;
@@ -148,8 +150,21 @@ long ddb_open_sync(struct ddb *ddb,
 
   ddb->lock = 0;
 
-
   return 1;
+}
+
+void ddb_close(struct ddb *ddb, struct gt_w *w)
+{
+  while (gt_w_close(w, ddb->dbfd) < 0) {
+  }
+
+  free(ddb->mem);  
+  free(ddb->node_mem);  
+
+  ddb->cache_root = NULL;
+  ddb->route_root = NULL;
+  ddb->route_pos = 0;
+  ddb->lock = 0;
 }
 
 static struct cache_node *load_page(struct ddb *ddb,
@@ -1264,4 +1279,129 @@ long ddb_iter_next(struct ddb_result *res,
       node_ptr = fix_node_ptr(ddb, node_ptr);
     }
   }
+}
+
+long ddb_iter_get_key_and_key_len(void *key,
+                                  unsigned long *key_len,
+                                  struct ddb_iter *iter,
+                                  struct gt_w *w)
+{
+  struct ddb *ddb = iter->ddb;
+  char raw_buf[ddb->bsize * 2 - 1];
+  unsigned long raw_addr = (unsigned long)raw_buf;
+  raw_addr += ddb->bsize - 1;
+  raw_addr -= raw_addr % ddb->bsize;
+  void *aligned = (void*)raw_addr;
+
+  struct ddb_node node;
+  long r = _read(iter->ddb, aligned, iter->node_ptr, &node, 80, w);
+  if (!r)
+    goto err;
+
+  if (*key_len < node.key_len) {
+    *key_len = node.key_len;
+    return 1;
+  }
+
+  *key_len = node.key_len;
+  r = _read(iter->ddb, aligned, iter->node_ptr + 80, key, *key_len, w);
+  if (!r)
+    goto err;
+
+  return 1;
+
+err:
+  return 0;
+}
+
+long ddb_defragment(const char *name, struct ddb *ddb, struct gt_w *w)
+{
+  // lock the db
+  int lock_fd;
+  while (1) {
+    lock_fd = gt_w_openat(w,
+                          ddb->dirfd,
+                          ddb->write_lock_name,
+                          O_CREAT|O_RDWR|O_EXCL,
+                          0600);
+
+    if (lock_fd < 0)
+      gt_w_nop(w);
+
+    else
+      break;
+  }
+
+  // create new db
+  struct ddb *new_db;
+  long r; 
+
+  if (!ddb_create(name, 1024 * 1024))
+    goto err;
+
+  new_db = malloc(sizeof *new_db);
+  if (!new_db)
+    goto err;
+
+  if (!ddb_open_sync(new_db, name, ddb->dirfd, 64)) {
+    goto err1;
+  }
+
+  unsigned long buffer_size = 1024 * 1024 * 8;
+  char *buffer = malloc(buffer_size);
+  if (!buffer)
+    goto err2;
+   
+  struct ddb_result res;
+  struct ddb_iter iter;
+  ddb_iter(&iter, ddb, w);
+
+  while (ddb_iter_next(&res, &iter, w)) {
+    unsigned long key_len = 0;
+    if (!ddb_iter_get_key_and_key_len(NULL, &key_len, &iter, w))
+      goto err3;
+
+    char key[key_len];
+    if (!ddb_iter_get_key_and_key_len(key, &key_len, &iter, w))
+      goto err3;
+
+    if (res.size > buffer_size) {
+      char *new_buffer = realloc(buffer, res.size);
+      if (!buffer)
+        goto err3;
+
+      buffer = new_buffer;
+    }
+
+    if (ddb_read(&res, buffer, res.size, w) != res.size)
+      goto err3;
+
+    if (!ddb_insert(new_db, key, key_len, buffer, res.size, w))
+      goto err3;
+  }
+
+  // release old DB
+  while (gt_w_unlinkat(w, ddb->dirfd, ddb->write_lock_name, 0) < 0) {
+  }
+
+  free(buffer);
+
+  ddb_close(new_db, w);
+
+  return 1;
+
+err3:
+  free(buffer);
+err2:
+  ddb_close(new_db, w);
+
+  while (gt_w_unlinkat(w, new_db->dirfd, name, 0) < 0) {
+  }
+
+err1:
+  free(new_db);
+err:
+  while (gt_w_unlinkat(w, ddb->dirfd, ddb->write_lock_name, 0) < 0) {
+  }
+  return 0;
 }
