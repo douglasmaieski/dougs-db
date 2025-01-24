@@ -73,6 +73,14 @@ long ddb_open_sync(struct ddb *ddb,
                    int dirfd,
                    unsigned long cached_blocks);
 
+long ddb_insert(struct ddb *ddb,
+                const void *key,
+                unsigned long key_len,
+                const void *data,
+                unsigned long data_len,
+                struct gt_w *w);
+
+
 long ddb_upsert(struct ddb *ddb,
                 const void *key,
                 unsigned long key_len,

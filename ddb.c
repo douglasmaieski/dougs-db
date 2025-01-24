@@ -436,6 +436,241 @@ static long _append_route(struct ddb *ddb,
   return 1;
 }
 
+long ddb_insert(struct ddb *ddb,
+                const void *key,
+                unsigned long key_len,
+                const void *data,
+                unsigned long data_len,
+                struct gt_w *w)
+{
+  long lock_fd;
+
+  while (1) {
+    lock_fd = gt_w_openat(w, ddb->dirfd, "write-lock", O_CREAT|O_RDWR|O_EXCL, 0600);
+    if (lock_fd >= 0)
+      break;
+  }
+
+  struct ddb_node new_node;
+  compute_hash(new_node.hash, ddb, key, key_len);
+  new_node.size = data_len;
+  new_node.left = 0;
+  new_node.right = 0;
+  new_node.key_len = key_len;
+
+  unsigned long new_node_ptr = ddb->meta.file_ptr;
+  unsigned long bucket0 = new_node_ptr / ddb->bsize;
+  unsigned long bucket1 = (new_node_ptr + 80) / ddb->bsize;
+  if (bucket0 != bucket1)
+    new_node_ptr = bucket1 * ddb->bsize;
+
+  assert(new_node_ptr >= 4096 + 80);
+
+  unsigned long new_node_real_len = sizeof(struct ddb_node) + key_len;
+  new_node.content = new_node_ptr + new_node_real_len;
+
+  assert(new_node.content >= 4096 + 80 + 80);
+
+  // insert data
+  char raw_buf[ddb->bsize * 2 - 1];
+  unsigned long raw_addr = (unsigned long)raw_buf;
+  raw_addr += ddb->bsize - 1;
+  raw_addr -= raw_addr % ddb->bsize;
+  void *aligned = (void*)raw_addr;
+
+  long r;
+
+  r = _write(ddb, aligned, new_node_ptr + 80, key, key_len, w);
+  if (!r)
+    goto err;
+
+  if (data_len > 0) {
+    r = _write(ddb, aligned, new_node.content, data, data_len, w);
+    if (!r)
+      goto err;
+  }
+
+  while (gt_w_fsync(w, ddb->dbfd) < 0) {
+  }
+
+  unsigned long new_file_ptr = new_node.content + new_node.size;
+  
+  struct ddb_node node;
+  unsigned long ptr = ddb->meta.root_ptr;
+  unsigned int depth = 0;
+  struct ddb_route *route = _find_route(ddb, new_node.hash, w);
+  struct ddb_route *upserted = NULL;
+
+  if (route) {
+    ptr = route->addr;
+    depth = route->level;
+
+    if (memcmp(route->id, new_node.hash, 32) == 0) {
+      upserted = route;
+    }
+
+    unlock(&route->lock);
+  }
+
+  if (upserted) {
+    goto exists;
+  }
+
+  while (1) {
+    assert(ptr >= 4096);
+
+    r = _read(ddb, aligned, ptr, &node, 80, w);
+    if (!r)
+      goto err;
+
+    if (route) {
+      if (memcmp(route->id, node.hash, 32) != 0) {
+        route = NULL;
+      }
+    }
+
+    if (depth++ < 17 && !route) {
+      while (!try_lock(&ddb->map_lock)) {
+        gt_w_nop(w);
+      }
+
+      struct ddb_route *new_route = ddb->map + ddb->route_pos++;
+
+      memcpy(new_route->id, node.hash, 32);
+      new_route->addr = ptr;
+      new_route->lock = 0;
+
+      if (!_append_route(ddb, new_route, w))
+        --ddb->route_pos;
+
+      unlock(&ddb->map_lock);
+    }
+
+    route = NULL;
+
+    assert(node.parent || node.content == 4096 + 80);
+
+    int diff = memcmp(new_node.hash, node.hash, 32);
+    if (diff == 0) {
+      goto exists;
+    }
+
+    if (diff < 0) {
+      // go left
+      if (node.left == 0) {
+        new_node.parent = ptr;
+        node.left = new_node_ptr;
+
+        if (gt_w_write(w, lock_fd, 0, &new_node, 80) != 80) {
+          goto err;
+        }
+
+        while (gt_w_fsync(w, lock_fd) < 0) {
+        }
+
+        r = _write(ddb, aligned, new_node_ptr, &new_node, 80, w);
+        if (!r)
+          goto err;
+
+        r = _write(ddb, aligned, ptr, &node, 80, w);
+        if (!r)
+          goto err;
+
+        break;
+      }
+      else {
+        ptr = node.left;
+      }
+    }
+
+    else {
+      // go right
+      if (node.right == 0) {
+        new_node.parent = ptr;
+        node.right = new_node_ptr;
+
+        if (gt_w_write(w, lock_fd, 0, &new_node, 80) != 80) {
+          goto err;
+        }
+
+        while (gt_w_fsync(w, lock_fd) < 0) {
+        }
+
+        r = _write(ddb, aligned, new_node_ptr, &new_node, 80, w);
+        if (!r)
+          goto err;
+
+        r = _write(ddb, aligned, ptr, &node, 80, w);
+        if (!r)
+          goto err;
+
+        break;
+      }
+      else {
+        ptr = node.right;
+      }
+    }
+
+    ++depth;
+  }
+
+  if (depth++ < 17) {
+    while (!try_lock(&ddb->map_lock)) {
+      gt_w_nop(w);
+    }
+
+    struct ddb_route *new_route = ddb->map + ddb->route_pos++;
+
+    memcpy(new_route->id, new_node.hash, 32);
+    new_route->addr = new_node_ptr;
+    new_route->lock = 0;
+
+    if (!_append_route(ddb, new_route, w))
+      --ddb->route_pos;
+
+    unlock(&ddb->map_lock);
+  }
+
+  ddb->meta.file_ptr = new_file_ptr;
+
+  r = _write(ddb, aligned, 0, &ddb->meta, 32, w);
+  if (!r)
+    goto err;
+
+  while (gt_w_fsync(w, ddb->dbfd) < 0) {
+  }
+
+  while (gt_w_close(w, lock_fd) < 0) {
+  }
+
+  while (gt_w_unlinkat(w, ddb->dirfd, "write-lock", 0) < 0) {
+  }
+
+  return 1;
+
+exists:
+  while (gt_w_fsync(w, ddb->dbfd) < 0) {
+  }
+
+  while (gt_w_close(w, lock_fd) < 0) {
+  }
+
+  while (gt_w_unlinkat(w, ddb->dirfd, "write-lock", 0) < 0) {
+  }
+
+  return 0;
+  
+err:
+  while (gt_w_close(w, lock_fd) < 0) {
+  }
+
+  while (gt_w_unlinkat(w, ddb->dirfd, "write-lock", 0) < 0) {
+  }
+
+  return -1;
+}
+
+
 long ddb_upsert(struct ddb *ddb,
                 const void *key,
                 unsigned long key_len,
