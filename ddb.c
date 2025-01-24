@@ -262,6 +262,10 @@ static void invalidate_page(struct ddb *ddb, unsigned long idx, struct gt_w *w)
 
     cache_node->idx = 0xffffffffffffffff - idx;
 
+    // keep it at the head of the list
+    list_remove(&ddb->cache_list, &cache_node->list_node);
+    list_push_head(&ddb->cache_list, &cache_node->list_node);
+
     avl_tree_remove(&ddb->cache_root, &cache_node->avl_node);
     avl_tree_insert(&ddb->cache_root, &cache_node->avl_node, avl_cmp);
   }
@@ -327,7 +331,7 @@ static long _write(struct ddb *ddb,
 
     unsigned long start = pos / ddb->bsize;
     unsigned long page_count = size / ddb->bsize;
-    for (unsigned long idx = start, idx < start + page_count; ++idx)
+    for (unsigned long idx = start; idx < start + page_count; ++idx)
       invalidate_page(ddb, idx, w);
 
     if (size != avail)
