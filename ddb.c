@@ -325,8 +325,9 @@ static long _write(struct ddb *ddb,
     if (r != size)
       goto err;
 
+    unsigned long start = pos / ddb->bsize;
     unsigned long page_count = size / ddb->bsize;
-    for (unsigned long idx = pos / ddb->bsize; idx < page_count; ++idx)
+    for (unsigned long idx = start, idx < start + page_count; ++idx)
       invalidate_page(ddb, idx, w);
 
     if (size != avail)
